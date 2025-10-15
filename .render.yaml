@@ -1,0 +1,8 @@
+services:
+  - type: cron
+    name: macd-screener-cron
+    env: python
+    schedule: "0 1 * * *"     # chạy 01:00 UTC mỗi ngày
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "bash run.sh"
+    plan: free
