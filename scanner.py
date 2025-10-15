@@ -3,8 +3,12 @@
 import argparse, csv, math, os, requests, pandas as pd
 from datetime import datetime
 
-BINANCE_API = "https://api.binance.me"
-
+BINANCE_API = "https://api.binance.com"
+proxies = {
+    "http": "http://<proxy_ip>:<proxy_port>",
+    "https": "http://<proxy_ip>:<proxy_port>",
+}
+r = requests.get(f"{BINANCE_API}/api/v3/exchangeInfo", proxies=proxies)
 def get_all_usdt_spot_symbols():
     r = requests.get(f"{BINANCE_API}/api/v3/exchangeInfo", timeout=20)
     r.raise_for_status()
