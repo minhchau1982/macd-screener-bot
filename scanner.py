@@ -3,7 +3,7 @@
 import argparse, csv, math, os, requests, pandas as pd
 from datetime import datetime
 
-BINANCE_API = "https://api.binance.me"
+BINANCE_API = "https://api-gcp.binance.com"
 
 def get_all_usdt_spot_symbols():
     r = requests.get(f"{BINANCE_API}/api/v3/exchangeInfo", timeout=20)
