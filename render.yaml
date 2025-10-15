@@ -5,4 +5,4 @@ services:
     schedule: "0 1 * * *"     # chạy 01:00 UTC mỗi ngày
     buildCommand: "pip install -r requirements.txt"
     startCommand: "bash run.sh"
-    plan: starter
+    plan: free
