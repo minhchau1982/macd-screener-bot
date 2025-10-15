@@ -99,14 +99,20 @@ def main():
             w.writeheader(); w.writerows(results)
         print(f"Saved {args.out} with {len(results)} rows.")
         send_telegram(args.out, f"✅ Binance MACD 1W Screener\nSymbols: {len(results)}\nUTC: {datetime.utcnow():%Y-%m-%d %H:%M}")
-    else:
-        print("No matches today.")
-        # optional: notify when empty
-        token = os.getenv("TELEGRAM_BOT_TOKEN",""); chat = os.getenv("TELEGRAM_CHAT_ID","")
-        if token and chat:
-            requests.get(f"https://api.telegram.org/bot{token}/sendMessage",
-                         params={"chat_id":chat,"text":f"⛔ Không có coin đạt tiêu chí hôm nay (UTC {datetime.utcnow():%Y-%m-%d})."},
-                         timeout=15)
+  else:
+    print("No matches today.")
+    # optional: notify when empty
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat = os.getenv("TELEGRAM_CHAT_ID", "")
+    if token and chat:
+        requests.get(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            params={
+                "chat_id": chat,
+                "text": f"⛔ Không có coin đạt tiêu chí hôm nay (UTC {datetime.utcnow():%Y-%m-%d})."
+            },
+            timeout=15
+        )
 
 if __name__ == "__main__":
     main()
