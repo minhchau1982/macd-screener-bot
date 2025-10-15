@@ -1,23 +1,27 @@
 from flask import Flask, jsonify
-import subprocess, os, datetime
-
-def run_scan():
-    cmd = ["python", "scanner.py", "--min-vol", "500000", "--min-price", "0.01", "--limit", "180"]
-    subprocess.run(cmd, check=False)
+from datetime import datetime
+import subprocess
 
 app = Flask(__name__)
 
-@app.route("/")
-def health():
-    return "OK", 200
+@app.route('/')
+def home():
+    return "✅ MACD Screener Bot is running!"
 
-@app.route("/run")
+@app.route('/run')
 def run():
-    run_scan()
-    return jsonify({
-        "status": "ok",
-        "ran_at_utc": datetime.datetime.utcnow().isoformat() + "Z"
-    })
+    try:
+        # chạy scanner.py
+        subprocess.run(["python3", "scanner.py"], check=True)
+        return jsonify({
+            "status": "ok",
+            "ran_at_utc": datetime.utcnow().isoformat() + "Z"
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=10000)
