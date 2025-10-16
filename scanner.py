@@ -1,100 +1,64 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import argparse, csv, math, os, time, random, requests, pandas as pd
+import os, csv, time, math, requests, pandas as pd
 from datetime import datetime, timezone
 
-# ===== Binance public endpoints (không cần API key) =====
-BINANCE_ENDPOINTS = [
-    "https://api.binance.com",          # mặc định
-    "https://api-gcp.binance.com",      # cụm GCP
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://api4.binance.com",
-    # data-api chỉ có market data public
-    "https://data-api.binance.vision"
-]
+BINANCE_API = "https://data-api.binance.vision"
+TIMEOUT = 15
 
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; macd-screener/1.0)",
-    "Accept": "application/json",
-    "Connection": "close",
-})
-
-def _sleep_backoff(attempt: int):
-    # backoff + jitter
-    time.sleep(min(2 ** attempt + random.random(), 8.0))
-
-def binance_get(path: str, params=None, timeout=15):
-    """
-    Gọi GET với fallback qua nhiều endpoint.
-    Tự động đổi endpoint khi gặp 451/403/429/5xx hoặc timeout.
-    """
-    params = params or {}
+def _get(url, params=None, max_retries=3, backoff=0.8):
+    """GET có retry nhẹ để tránh lỗi tạm (451/5xx)."""
     last_err = None
-    # xoay vòng danh sách endpoint, shuffle nhẹ để tránh dính 1 cụm
-    endpoints = BINANCE_ENDPOINTS[:]
-    random.shuffle(endpoints)
-    for attempt in range(len(endpoints)):
-        base = endpoints[attempt]
-        url = f"{base}{path}"
+    for i in range(max_retries):
         try:
-            r = SESSION.get(url, params=params, timeout=timeout)
-            # nếu bị 451/403/429 hoặc 5xx -> thử endpoint khác
-            if r.status_code in (451, 403, 429) or 500 <= r.status_code < 600:
-                last_err = requests.HTTPError(f"{r.status_code} {url}")
-                _sleep_backoff(attempt)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except requests.RequestException as e:
+            r = requests.get(url, params=params, timeout=TIMEOUT)
+            if r.status_code == 200:
+                return r
+            # vài WAF trả 451/403 -> thử lại
+            last_err = requests.HTTPError(f"{r.status_code} {r.text}")
+        except Exception as e:
             last_err = e
-            _sleep_backoff(attempt)
-            continue
-    # hết endpoint vẫn fail
-    if last_err:
-        raise last_err
-    raise RuntimeError("Unexpected request flow")
+        time.sleep(backoff * (2**i))
+    raise last_err
 
-# ====== Data helpers ======
 def get_all_usdt_spot_symbols():
-    data = binance_get("/api/v3/exchangeInfo")
+    r = _get(f"{BINANCE_API}/api/v3/exchangeInfo")
     syms = []
-    for s in data.get("symbols", []):
-        if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT" and s.get("isSpotTradingAllowed", False):
+    for s in r.json().get("symbols", []):
+        if (s.get("status")=="TRADING"
+            and s.get("quoteAsset")=="USDT"
+            and s.get("isSpotTradingAllowed", False)):
             name = s["symbol"]
-            if any(x in name for x in ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
+            if any(x in name for x in ("UPUSDT","DOWNUSDT","BULLUSDT","BEARUSDT")):
                 continue
             syms.append(name)
     return sorted(syms)
 
 def get_klines_weekly(symbol, limit=180):
-    arr = binance_get("/api/v3/klines", params={"symbol": symbol, "interval": "1w", "limit": limit})
-    if not arr:
-        return pd.DataFrame()
+    r = _get(f"{BINANCE_API}/api/v3/klines",
+             params={"symbol":symbol,"interval":"1w","limit":limit})
+    arr = r.json()
+    if not arr: return pd.DataFrame()
     df = pd.DataFrame(arr, columns=[
         "openTime","open","high","low","close","volume","closeTime",
-        "quoteAssetVolume","nt","tbBase","tbQuote","ignore"
+        "quoteAssetVolume","numTrades","tbb","tbq","ignore"
     ])
-    df["openTime"]  = pd.to_datetime(df["openTime"],  unit="ms", utc=True)
-    df["closeTime"] = pd.to_datetime(df["closeTime"], unit="ms", utc=True)
+    # ép kiểu
     for c in ["open","high","low","close","volume","quoteAssetVolume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df[["openTime","closeTime","open","high","low","close","volume","quoteAssetVolume"]]
+    return df
 
 def ema(s, span): return s.ewm(span=span, adjust=False).mean()
 def macd(close, fast=12, slow=26, signal=9):
-    m = ema(close, fast) - ema(close, slow)
-    s = ema(m, signal)
-    return m, s, m - s
+    m  = ema(close, fast) - ema(close, slow)
+    sg = ema(m, signal)
+    return m, sg, m - sg
 
 def crossed_up(a1_prev, a1_now, a2_prev, a2_now):
     return a1_prev <= a2_prev and a1_now > a2_now
 
-def screen(df, min_qv, min_price):
-    if len(df) < 35:
-        return None
+def screen_one(df, min_qv, min_price):
+    if len(df) < 35: return None
     last_close = float(df["close"].iloc[-1])
     avg_qv6 = float(df["quoteAssetVolume"].tail(6).mean())
     if math.isnan(avg_qv6) or avg_qv6 < min_qv or last_close < min_price:
@@ -104,10 +68,13 @@ def screen(df, min_qv, min_price):
     s_prev, s_now = float(s.iloc[-2]), float(s.iloc[-1])
     h_prev, h_now = float(h.iloc[-2]), float(h.iloc[-1])
 
-    cut_up = crossed_up(m_prev, m_now, s_prev, s_now)
-    on_top_small = (m_now > s_now) and (m_prev <= s_prev or abs(m_now - s_now) < max(1e-9, 0.15*abs(s_now)))
+    cut_up = crossed_up(m_prev, m_now, s_prev, s_now)     # MACD cắt lên
+    on_top_small = (m_now > s_now) and (m_prev <= s_prev or abs(m_now-s_now) < max(1e-9, 0.15*abs(s_now)))
+    # logic lọc: tín hiệu vừa cắt lên HOẶC nằm trên signal sát nhau,
+    # đồng thời MACD vẫn < 0 (điểm sớm) và histogram > 0
     if (cut_up or on_top_small) and (m_now < 0) and (h_now > 0):
-        score = (1 if cut_up else 0) + (0.5 if on_top_small else 0) + (0.7 if h_now > h_prev else 0) + min(1.0, avg_qv6/(10*min_qv))
+        score = (1 if cut_up else 0) + (0.5 if on_top_small else 0) + (0.7 if h_now > h_prev else 0) \
+                + min(1.0, avg_qv6/(10*min_qv))
         return {
             "close": round(last_close, 8),
             "avg_qv_6w": round(avg_qv6, 2),
@@ -118,82 +85,56 @@ def screen(df, min_qv, min_price):
         }
     return None
 
-# ====== Telegram ======
-def send_telegram_file(file_path, caption=""):
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat  = os.getenv("TELEGRAM_CHAT_ID", "")
+def send_telegram_document(file_path, caption):
+    token = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+    chat  = os.getenv("TELEGRAM_CHAT_ID","").strip()
     if not token or not chat:
-        print("Telegram skipped: missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+        print("Telegram: thiếu TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID")
         return
-    try:
-        with open(file_path, "rb") as f:
-            r = requests.post(
-                f"https://api.telegram.org/bot{token}/sendDocument",
-                data={"chat_id": chat, "caption": caption, "parse_mode": "HTML"},
-                files={"document": (os.path.basename(file_path), f, "text/csv")},
-                timeout=30,
-            )
-            r.raise_for_status()
-        print("Telegram: sent.")
-    except Exception as e:
-        print("Telegram error:", e)
+    with open(file_path, "rb") as f:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendDocument",
+                          data={"chat_id":chat,"caption":caption},
+                          files={"document":(os.path.basename(file_path), f, "text/csv")},
+                          timeout=20)
+        print("Telegram:", r.status_code, r.text[:200])
 
-def send_telegram_text(msg):
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat  = os.getenv("TELEGRAM_CHAT_ID", "")
-    if not token or not chat:
-        return
-    try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            params={"chat_id": chat, "text": msg},
-            timeout=15,
-        )
-        r.raise_for_status()
-    except Exception as e:
-        print("Telegram error:", e)
+def send_telegram_text(text):
+    token = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+    chat  = os.getenv("TELEGRAM_CHAT_ID","").strip()
+    if not token or not chat: return
+    requests.get(f"https://api.telegram.org/bot{token}/sendMessage",
+                 params={"chat_id":chat,"text":text}, timeout=15)
 
-# ====== Main ======
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--min-vol", type=float, default=300000.0)
-    ap.add_argument("--min-price", type=float, default=0.005)
-    ap.add_argument("--limit", type=int, default=180)
-    ap.add_argument("--out", type=str, default="scan_results.csv")
-    args = ap.parse_args()
-
-    print("Loading symbols…")
+def run_scan(min_vol=300000.0, min_price=0.005, limit=180, out_path="scan_results.csv"):
+    print(">> Loading USDT spot symbols ...")
     syms = get_all_usdt_spot_symbols()
-
-    results = []
+    print(f">> Found {len(syms)} symbols.")
+    rows = []
     for i, sym in enumerate(syms, 1):
         try:
-            df = get_klines_weekly(sym, args.limit)
-            if df.empty:
-                continue
-            rec = screen(df, args.min_vol, args.min_price)
-            if rec:
-                results.append({"symbol": sym, **rec})
+            df = get_klines_weekly(sym, limit=limit)
+            if df.empty: continue
+            rec = screen_one(df, min_vol, min_price)
+            if rec: rows.append({"symbol":sym, **rec})
         except Exception as e:
-            # log ngắn gọn, tránh spam
-            print(f"[{sym}] error: {e}")
-        if i % 25 == 0:
-            print(f"Scanned {i}/{len(syms)}")
+            # bỏ qua lỗi lẻ
+            print("skip", sym, "->", e)
+        if i % 30 == 0:
+            print(f"scanned {i}/{len(syms)}")
 
-    results.sort(key=lambda x: (x["score"], x["avg_qv_6w"]), reverse=True)
-    if results:
-        with open(args.out, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["symbol", "close", "avg_qv_6w", "macd", "signal", "hist", "score"])
-            w.writeheader()
-            w.writerows(results)
-        print(f"Saved {args.out} with {len(results)} rows.")
-        send_telegram_file(
-            args.out,
-            f"✅ Binance MACD 1W Screener\nSymbols: {len(results)}\nUTC: {datetime.now(timezone.utc):%Y-%m-%d %H:%M}",
-        )
+    rows.sort(key=lambda x: (x["score"], x["avg_qv_6w"]), reverse=True)
+    utc_now = datetime.now(timezone.utc)
+    if rows:
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["symbol","close","avg_qv_6w","macd","signal","hist","score"])
+            w.writeheader(); w.writerows(rows)
+        caption = f"✅ Binance MACD 1W Screener\nSymbols: {len(rows)}\nUTC: {utc_now:%Y-%m-%d %H:%M}"
+        send_telegram_document(out_path, caption)
     else:
-        print("No matches today.")
-        send_telegram_text(f"⛔ Không có coin đạt tiêu chí hôm nay (UTC {datetime.now(timezone.utc):%Y-%m-%d}).")
+        send_telegram_text(f"⛔ Không có coin đạt tiêu chí hôm nay (UTC {utc_now:%Y-%m-%d}).")
+
+    return {"count": len(rows), "saved": bool(rows), "utc": utc_now.isoformat()}
 
 if __name__ == "__main__":
-    main()
+    info = run_scan()
+    print(info)
